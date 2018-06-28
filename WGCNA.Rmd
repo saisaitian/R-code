@@ -1,0 +1,392 @@
+---
+title: "WGCNA"
+author: "TSS"
+date: "2018年6月19日"
+output: html_document
+---
+### 1 文件准备
+```{r}
+suppressMessages(require(WGCNA))  
+suppressMessages(require(caret))
+options(stringsAsFactors = FALSE)
+allowWGCNAThreads()###加快运行速度
+enableWGCNAThreads(nThreads = 7)##设置电脑可用核数
+femData = read.csv("C:/Users/Administrator/Desktop/wgcna/WGCNA项目/WGCNA官网项目/LiverFemale3600.csv")
+
+```
+### 查看数据文件
+```{r}
+dim(femData)
+```
+### 查看大数据，推荐fix函数
+```{r}
+fix(femData)
+```
+### 数据预处理及去除一些不需要的文件
+
+```{r}
+datExpr0 = as.data.frame(t(femData[, -c(1:8)]))
+names(datExpr0) = femData$substanceBXH
+rownames(datExpr0) = names(femData)[-c(1:8)]
+```
+### 1 样本前检查
+```{r}
+gsg = goodSamplesGenes(datExpr0, verbose = 3);
+gsg$allOK
+
+```
+
+### 样本数聚类
+```{r}
+sampleTree = hclust(dist(datExpr0), method = "average")
+sizeGrWindow(12,9)
+par(cex = 0.6);
+par(mar = c(0,4,2,0))
+plot(sampleTree, main = "Sample clustering to detect outliers", sub="", xlab="", cex.lab = 1.5,
+     cex.axis = 1.5, cex.main = 2)
+
+### 观察到一个离群样本(sampleF2_221). 
+abline(h = 15, col = "red")
+clust = cutreeStatic(sampleTree, cutHeight = 15, minSize = 10)
+keepSamples = (clust==1)
+datExpr = datExpr0[keepSamples, ]
+nGenes = ncol(datExpr)
+nSamples = nrow(datExpr)
+```
+
+
+### 2 加载临床信息
+
+```{r}
+traitData = read.csv("C:/Users/Administrator/Desktop/wgcna/WGCNA项目/WGCNA官网项目/ClinicalTraits.csv")
+
+dim(traitData)
+
+allTraits = traitData[, -c(31, 16)]
+allTraits = allTraits[, c(2, 11:36) ]
+dim(allTraits)
+
+femaleSamples = rownames(datExpr)
+traitRows = match(femaleSamples, allTraits$Mice)
+datTraits = allTraits[traitRows,-1 ]
+rownames(datTraits) = allTraits[traitRows, 1]
+collectGarbage()
+
+```
+
+```{r}
+sampleTree2 = hclust(dist(datExpr), method = "average")
+traitColors = numbers2colors(datTraits, signed = F);
+
+plotDendroAndColors(sampleTree2, traitColors,
+                    groupLabels = names(datTraits),
+                    main = "Sample dendrogram and trait heatmap")
+```
+
+
+## 3 选择合适阈值
+```{r}
+
+powers = c(c(1:10), seq(from = 12, to=20, by=2))
+
+sft = pickSoftThreshold(datExpr, powerVector = powers, verbose = 5)
+sizeGrWindow(9, 5)
+par(mfrow = c(1,2));
+cex1 = 0.9;
+
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     xlab="Soft Threshold (power)",ylab="Scale Free Topology Model Fit,signed R^2",type="n",
+     main = paste("Scale independence"));
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     labels=powers,cex=cex1,col="red");
+
+abline(h=0.90,col="red")
+
+plot(sft$fitIndices[,1], sft$fitIndices[,5],
+     xlab="Soft Threshold (power)",ylab="Mean Connectivity", type="n",
+     main = paste("Mean connectivity"))
+text(sft$fitIndices[,1], sft$fitIndices[,5], labels=powers, cex=cex1,col="red")
+## 最佳阈值可以由下面函数确定，本例为 6
+sft$powerEstimate
+
+```
+
+### 4 网络构建
+```{r}
+net = blockwiseModules(datExpr, power = 6,
+                       TOMType = "unsigned", minModuleSize = 30,
+                       reassignThreshold = 0, mergeCutHeight = 0.25,
+                       numericLabels = TRUE, pamRespectsDendro = FALSE,
+                       saveTOMs = TRUE,
+                       saveTOMFileBase = "femaleMouseTOM",
+                       verbose = 3)
+## 一般 我们需要改一下power参数即可，其他可以选择默认
+
+table(net$colors)
+
+```
+
+```{r}
+sizeGrWindow(12, 9)
+mergedColors = labels2colors(net$colors)
+plotDendroAndColors(net$dendrograms[[1]], mergedColors[net$blockGenes[[1]]],
+                    "Module colors",
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05)
+
+moduleLabels = net$colors
+moduleColors = labels2colors(net$colors)
+MEs = net$MEs;
+geneTree = net$dendrograms[[1]]
+
+
+```
+## 5 模块保守性分析
+```{r}
+## 由于做保守性分析需要两个表达矩阵，即训练和测试，这里我随机切分之前的表达矩阵，来对训练数据集做保守性分析，当然最好一开始就做切分，我这里直接再次切分，给大家提供参考
+inTraining <- createDataPartition(datExpr$MMT00000044, p = 0.75, list = FALSE)
+train<- datExpr[inTraining,]
+test<-datExpr[-inTraining,]
+setLabels = c("Train", "Test");
+multiExpr = list(Train = list(data = train), Test = list(data = test));
+multiColor = list(Train =moduleColors  );
+nSets = 2
+mp = modulePreservation(multiExpr, multiColor,
+                        referenceNetworks = 1,
+                        nPermutations = 20,
+                        randomSeed = 1,
+                        quickCor = 0,
+                        verbose = 3)
+##save(mp,file = "mp.Rda") 这个很费时间，建议保存一下，nPermutations官网上给了200，我为节省时间给了20
+ref = 1
+test = 2
+statsObs = cbind(mp$quality$observed[[ref]][[test]][, -1], mp$preservation$observed[[ref]][[test]][, -1])
+statsZ = cbind(mp$quality$Z[[ref]][[test]][, -1], mp$preservation$Z[[ref]][[test]][, -1]);
+print( cbind(statsObs[, c("medianRank.pres", "medianRank.qual")],
+             signif(statsZ[, c("Zsummary.pres", "Zsummary.qual")], 2)) )
+
+
+# Module labels and module sizes are also contained in the results
+modColors = rownames(mp$preservation$observed[[ref]][[test]])
+moduleSizes = mp$preservation$Z[[ref]][[test]][, 1];
+# leave grey and gold modules out
+plotMods = !(modColors %in% c("grey", "gold"));
+# Text labels for points
+text = modColors[plotMods];
+# Auxiliary convenience variable
+plotData = cbind(mp$preservation$observed[[ref]][[test]][, 2], mp$preservation$Z[[ref]][[test]][, 2])
+# Main titles for the plot
+mains = c("Preservation Median rank", "Preservation Zsummary");
+# Start the plot
+sizeGrWindow(10, 5);
+#pdf(fi="Plots/BxHLiverFemaleOnly-modulePreservation-Zsummary-medianRank.pdf", wi=10, h=5)
+par(mfrow = c(1,2))
+par(mar = c(4.5,4.5,2.5,1))
+for (p in 1:2)
+{
+  min = min(plotData[, p], na.rm = TRUE);
+  max = max(plotData[, p], na.rm = TRUE);
+  # Adjust ploting ranges appropriately
+  if (p==2)
+  {
+    if (min > -max/10) min = -max/10
+    ylim = c(min - 0.1 * (max-min), max + 0.1 * (max-min))
+  } else
+    ylim = c(min - 0.1 * (max-min), max + 0.1 * (max-min))
+  plot(moduleSizes[plotMods], plotData[plotMods, p], col = 1, bg = modColors[plotMods], pch = 21,
+       main = mains[p],
+       cex = 2.4,
+       ylab = mains[p], xlab = "Module size", log = "x",
+       ylim = ylim,
+       xlim = c(10, 2000), cex.lab = 1.2, cex.axis = 1.2, cex.main =1.4)
+  labelPoints(moduleSizes[plotMods], plotData[plotMods, p], text, cex = 1, offs = 0.08);
+  # For Zsummary, add threshold lines
+  if (p==2)
+  {
+    abline(h=0)
+    abline(h=2, col = "blue", lty = 2)
+    abline(h=10, col = "darkgreen", lty = 2)
+  }
+}
+# If plotting into a file, close it
+## 大部分模块均大于10，说明保守性强
+```
+
+
+
+
+
+
+
+## 6 临床性状和表达热图
+```{r}
+nGenes = ncol(datExpr)
+nSamples = nrow(datExpr)
+MEs0 = moduleEigengenes(datExpr, moduleColors)$eigengenes
+MEs = orderMEs(MEs0) 
+moduleTraitCor = cor(MEs, datTraits, use = "p")
+moduleTraitPvalue = corPvalueStudent(moduleTraitCor, nSamples)
+sizeGrWindow(10,6)
+textMatrix = paste(signif(moduleTraitCor, 2), "\n(",
+                   signif(moduleTraitPvalue, 1), ")", sep = "");
+dim(textMatrix) = dim(moduleTraitCor)
+par(mar = c(6, 8.5, 3, 3));
+
+labeledHeatmap(Matrix = moduleTraitCor,
+               xLabels = names(datTraits),
+               yLabels = names(MEs),
+               ySymbols = names(MEs),
+               colorLabels = FALSE,
+               colors = greenWhiteRed(50),
+               textMatrix = textMatrix,
+               setStdMargins = FALSE,
+               cex.text = 0.5,
+               zlim = c(-1,1),
+               main = paste("Module-trait relationships"))
+
+
+
+```
+
+
+
+###  模块显著性关系
+```{r}
+GS1=as.numeric(cor(datTraits$weight_g,datExpr, use="p"))
+GeneSignificance=abs(GS1)
+
+colorh1= moduleColors
+ModuleSignificance=tapply(GeneSignificance, colorh1, mean, na.rm=T)
+sizeGrWindow(8,7)
+par(mfrow = c(1,1))
+plotModuleSignificance(GeneSignificance,colorh1, main = "Gene significance ",xlab = "Moudle Significance")
+```
+
+
+### hub gene
+
+
+```{r}
+
+
+weight = as.data.frame(datTraits$weight_g)
+names(weight) = "weight"
+
+modNames = substring(names(MEs), 3)
+geneModuleMembership = as.data.frame(cor(datExpr, MEs, use = "p"))
+MMPvalue = as.data.frame(corPvalueStudent(as.matrix(geneModuleMembership), nSamples))
+names(geneModuleMembership) = paste("MM", modNames, sep="")
+
+names(MMPvalue) = paste("p.MM", modNames, sep="")
+geneTraitSignificance = as.data.frame(cor(datExpr, weight, use = "p"))
+GSPvalue = as.data.frame(corPvalueStudent(as.matrix(geneTraitSignificance), nSamples))
+names(geneTraitSignificance) = paste("GS.", names(weight), sep="")
+names(GSPvalue) = paste("p.GS.", names(weight), sep="")
+
+module = "brown"
+
+column = match(module, modNames);
+moduleGenes = moduleColors==module;
+sizeGrWindow(7, 7);
+par(mfrow = c(1,1));
+verboseScatterplot(abs(geneModuleMembership[moduleGenes, column]),
+                   abs(geneTraitSignificance[moduleGenes, 1]),
+                   xlab = paste("Module Membership in", module, "module"),
+                   ylab = "Gene significance for body weight",
+                   main = paste("Module membership vs. gene significance\n"),
+                   cex.main = 1.2, cex.lab = 1.2, cex.axis = 1.2, col = module)
+abline(h=0.20,col="red")
+abline(v=0.80,col="red")
+
+FilterGenes= abs(geneModuleMembership[moduleGenes, column])> .8 & abs(geneTraitSignificance[moduleGenes, 1])>.2
+
+table(FilterGenes)
+length(names(datExpr)[moduleColors=="brown"]) 
+names(datExpr)[moduleColors=="brown"][FilterGenes]
+
+
+##  hub gene
+
+names(datExpr)[moduleColors=="brown"][FilterGenes]
+
+
+```
+
+###  7 热图
+```{r}
+dissTOM = 1-TOMsimilarityFromExpr(datExpr, power = 6)
+
+nSelect = 400
+
+set.seed(10);
+select = sample(nGenes, size = nSelect);
+selectTOM = dissTOM[select, select];
+selectTree = hclust(as.dist(selectTOM), method = "average")
+selectColors = moduleColors[select];
+sizeGrWindow(9,9)
+plotDiss = selectTOM^7;
+diag(plotDiss) = NA;
+TOMplot(plotDiss, selectTree, selectColors, main = "Network heatmap plot, selected genes")
+```
+
+
+
+
+
+
+## 特征基因可视化
+```{r}
+
+MEs = moduleEigengenes(datExpr, moduleColors)$eigengenes
+
+weight = as.data.frame(datTraits$weight_g);
+names(weight) = "weight"
+
+MET = orderMEs(cbind(MEs, weight))
+
+sizeGrWindow(5,7.5);
+par(cex = 0.9)
+plotEigengeneNetworks(MET, "", marDendro = c(0,4,1,2), marHeatmap = c(3,4,1,2), cex.lab = 0.8, xLabelsAngle = 90)
+
+sizeGrWindow(6,6);
+par(cex = 1.0)
+plotEigengeneNetworks(MET, "Eigengene dendrogram", marDendro = c(0,4,2,0),
+                      plotHeatmaps = FALSE)
+
+par(cex = 1.0)
+plotEigengeneNetworks(MET, "Eigengene adjacency heatmap", marHeatmap = c(3,4,2,2),
+                      plotDendrograms = FALSE, xLabelsAngle = 90)
+
+```
+
+## 8 文件导出Exporting to Cytoscape
+```{r}
+TOM = TOMsimilarityFromExpr(datExpr, power = 6)
+annot = read.csv(file = "C:/Users/Administrator/Desktop/wgcna/WGCNA项目/WGCNA官网项目/GeneAnnotation.csv")
+
+modules = c("brown")
+
+probes = names(datExpr)
+inModule = is.finite(match(moduleColors, modules))
+modProbes = probes[inModule]
+modGenes = annot$gene_symbol[match(modProbes, annot$substanceBXH)]
+
+modTOM = TOM[inModule, inModule]
+dimnames(modTOM) = list(modProbes, modProbes)
+
+
+nTop = 30;
+IMConn = softConnectivity(datExpr[, modProbes])
+top = (rank(-IMConn) <= nTop)
+filter <- modTOM[top, top]
+###导出到Cytoscape,会在你的目录下生成边文件和节点文件
+cyt = exportNetworkToCytoscape(
+  filter,
+  edgeFile = paste("CytoscapeInput-edges-", paste(module, collapse="-"), ".txt", sep=""),
+  nodeFile = paste("CytoscapeInput-nodes-", paste(module, collapse="-"), ".txt", sep=""),
+  weighted = TRUE,
+  threshold = 0.02,
+  nodeNames = modProbes[top], 
+  nodeAttr = moduleColors[inModule][top]
+)
+```
