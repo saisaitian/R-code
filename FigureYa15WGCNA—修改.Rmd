@@ -1,0 +1,437 @@
+---
+title: "FigureYa15 WGCNA"
+author: "小丫画图"
+date: "2018.6.28"
+output: html_document
+---
+微信ID: epigenomics  E-mail: epigenomics@rainbow-genome.com
+
+本代码作者：TSS，他来自生信菜鸟团
+
+[<img src="http://p3gnrt3qv.bkt.clouddn.com/bolg/180622/9h1c1i77J2.png?imageslim" width="100px"/>](http://p3gnrt3qv.bkt.clouddn.com/bolg/180622/9h1c1i77J2.png?imageslim)
+
+小丫编译用法、校验代码
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### 需求描述
+用R代码画出paper里的WGCNA结果图、同一模块内部的基因表达谱拟合，输出模块基因表达谱，用于绘制heatmap和功能富集分析。
+
+例子一：这篇paper里的WGCNA结果图
+
+![](demo1.jpg)
+
+出自<https://doi.org/10.18632/oncotarget.15842>
+
+例子二：用WGCNA找出gene module，用拟合的方式，展示每个module里的基因表达谱。
+
+![](demo2.png)
+
+出自<http://www.pnas.org/content/112/43/13360>
+
+例子三：用WGCNA找出的module画热图。把各个module的基因作为文件输出，将用于代码9或代码17的输入文件。
+
+![](demo3.png)
+
+出自<https://www.cell.com/cell/abstract/S0092-8674(18)30511-7>
+
+### 应用场景
+
+不需要筛差异表达基因，直接从全基因组找表达谱相似的gene组成的gene module（模块）。尤其适合样本量超过15的高通量测序数据。
+
+用于研究表型的差异是由哪些gene决定的，例如找出决定不同发育阶段、疾病亚型、药物处理反应的关键基因module，进而鉴定新的biomarkers或治疗靶标。
+
+借鉴文章里的应用方案：
+
+#### 方案一：找gene module作为biomarker
+
+例子一的paper用TCGA的papillary renal cell carcinoma (PRCC) RNA-seq数据找出差异表达基因，用WGCNA找出11个共表达的基因模块。其中蓝色模块与病理状态高度相关（r=0.45），其功能富集在nuclear division, cell cycle phase, and spindle。蓝色模块中的40个关键基因可以区分癌症亚型，有望用做biomarker。
+
+#### 方案一：用拟合的曲线展示各gene module的基因表达谱
+
+例子二的paper，用每个module排名前30基因的均值拟合表达谱曲线。
+
+#### 方案二：用热图和表格展示gene module-表达谱-功能-表型的关系
+
+例子三左边的热图是用module里的gene画的，每个module就相当于大家熟悉的热图里的cluster，因此，不用再做聚类。
+
+右侧的富集分析表格的做法：先为每个module里的基因做功能富集分析；然后取排名第一的通路的term，粘贴到该module热图的右侧。
+
+
+### 输入数据的预处理
+
+输入数据是12219个TPM > 1的基因在20个sample里的TPM。包括5种细胞、2种处理、2次重复。
+
+数据来源：<https://www.cell.com/cms/attachment/2119342979/2092476184/mmc2.xlsx>
+
+```{r}
+mydata= read.csv("easy_input_exp.csv",row.names = 1)
+dim(mydata)
+#此处用head(mydata)看出行名是基因名，第1列至第20列是基因在20个sample里的表达量
+head(mydata)
+#如果你的sample比较多，几十上百个的，推荐用fix函数来查看，MAC系统可能要另外安装XQuartz。运行下面这行来代替head(mydata)
+#fix(mydata)
+```
+
+转置，也就是行变成列，列变成行
+
+```{r}
+datExpr0 = data.frame(t(mydata))
+colnames(datExpr0) <- rownames(mydata)
+rownames(datExpr0) <- colnames(mydata)
+```
+
+这套数据的作者用的是TPM > 1的所有基因，如果你也想这样做，就先运行下面这行代码，跳过“筛选方差前25%的基因”，直接进入下一部分。
+
+```r
+datExpr1<-datExpr0
+```
+
+#### 筛选方差前25%的基因
+
+输入数据的作者选取的是TPM>1的基因作为WGCNA的输入。基因数量较多，对电脑要求高。为了便于大家在自己的电脑上操作本套代码，此处挑选了变化较大的前25%的基因。
+
+用前25%的基因会比用全部基因找出来的module数量少。
+
+```{r}
+m.vars=apply(datExpr0,2,var)
+expro.upper=datExpr0[,which(m.vars>quantile(m.vars, probs = seq(0, 1, 0.25))[4])]
+datExpr1<-data.matrix(expro.upper)
+```
+
+#### 判断是否有不好的sample或gene
+
+先检查是否有哪个sample或基因表达量缺失，定义成不好的sample或gene
+
+```{r,warning=FALSE,message=FALSE}
+library(WGCNA)
+gsg = goodSamplesGenes(datExpr1, verbose = 3);
+gsg$allOK
+```
+
+如果这里返回的结果是`TRUE`，说明所有基因都通过了检查。
+
+如果你用全部基因作为输入，很有可能返回`FALSE`，说明存在不好的基因或sample。
+
+下面的代码就会去除那些不好的基因或sample。
+
+#### 去除不好的sample或gene
+
+```{r}
+if (!gsg$allOK){
+  # Optionally, print the gene and sample names that were removed:
+  if (sum(!gsg$goodGenes)>0) 
+     printFlush(paste("Removing genes:", paste(names(datExpr0)[!gsg$goodGenes], collapse = ", ")));
+  if (sum(!gsg$goodSamples)>0) 
+     printFlush(paste("Removing samples:", paste(rownames(datExpr1)[!gsg$goodSamples], collapse = ", ")));
+  # Remove the offending genes and samples from the data:
+  datExpr1 = datExpr1[gsg$goodSamples, gsg$goodGenes]
+}
+```
+
+#### 判断是否有离群样本
+
+通过聚类分析，能看出是否有个别sample跟多数sample的距离较远，决定是否需要去除离群样本。
+
+```{r,fig.width=10, fig.height=5}
+sampleTree = hclust(dist(datExpr1), method = "average")
+par(cex = 0.7);
+par(mar = c(0,4,2,0))
+plot(sampleTree, main = "Sample clustering to detect outliers", sub="", xlab="", cex.lab = 1.5,
+     cex.axis = 1.5, cex.main = 2)
+```
+
+这套数据没有离群样本，不需要去除。
+
+如果你的数据有离群样本需要去除，就运行下面这段代码。
+
+#### 去除离群样本
+
+例如：以35000作为cutoff，就会去除最左边的4四个sample，只剩下16个sample。
+
+```{r,fig.width=10,fig.height=5}
+plot(sampleTree, main = "Sample clustering to detect outliers", sub="", xlab="", cex.lab = 1.5, cex.axis = 1.5, cex.main = 2) +
+#想用哪里切，就把“h = 35000”和“cutHeight = 35000”中的“500”换成你的cutoff
+abline(h = 35000, col = "red") 
+clust = cutreeStatic(sampleTree, cutHeight = 35000, minSize = 10)
+keepSamples = (clust==1)
+datExpr = datExpr1[keepSamples, ]
+nGenes = ncol(datExpr)
+nSamples = nrow(datExpr)
+dim(datExpr)
+```
+
+这套输入数据不需要去除离群样本，因此，跳过“去除离群样本”。
+
+运行下面的代码，用全部20个样本进行后续的分析：
+
+```{r, fig.width=10, fig.height=6}
+datExpr = as.data.frame(datExpr1)
+nGenes = ncol(datExpr)
+nSamples = nrow(datExpr)
+```
+
+### 找gene module
+
+WGCNA分析的关键是找gene module。先选择合适的阈值，通过构建网络找gene module，找出来的gene module可信度如何？要做Preservation，去除not preserved module。这样找出的共表达的gene module就可以用于下一步分析了。
+
+#### 选择构建网络的合适阈值
+
+通过这步计算，找出scale free topology modle fit接近0.9的最小power（soft threshold），用于下一步构建网络。
+
+```{r, fig.width=9, fig.height=5}
+powers = c(c(1:10), seq(from = 12, to=20, by=2))
+
+sft = pickSoftThreshold(datExpr, powerVector = powers, verbose = 5)
+
+pdf("1Threshold.pdf",width = 10, height = 5)
+par(mfrow = c(1,2))
+cex1 = 0.9
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     xlab="Soft Threshold (power)",ylab="Scale Free Topology Model Fit,signed R^2",type="n",
+     main = paste("Scale independence")) +
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     labels=powers,cex=cex1,col="red")+
+abline(h=0.90,col="red")
+
+plot(sft$fitIndices[,1], sft$fitIndices[,5],
+     xlab="Soft Threshold (power)",ylab="Mean Connectivity", type="n",
+     main = paste("Mean connectivity")) +
+text(sft$fitIndices[,1], sft$fitIndices[,5], labels=powers, cex=cex1,col="red")
+dev.off()
+```
+
+![](1Threshold.pdf)
+
+从上面的结果可以看出，从12开始进入“平台期”。因此，我们把下面代码里的`power`设置为`power = 12`
+
+#### 构建网络，找出gene module
+
+```{r}
+net = blockwiseModules(datExpr, power = 12,
+                       TOMType = "unsigned", minModuleSize = 30,
+                       reassignThreshold = 0, mergeCutHeight = 0.25,
+                       numericLabels = TRUE, pamRespectsDendro = FALSE,
+                       saveTOMs = TRUE,
+                       saveTOMFileBase = "MyTOM",
+                       verbose = 3)
+
+table(net$colors)
+```
+
+一共找出16个module，第二行分别对应每个module内的基因个数。
+
+#### gene module的可视化
+
+```{r}
+mergedColors = labels2colors(net$colors)
+
+pdf("2module.pdf",width = 10, height = 5)
+plotDendroAndColors(net$dendrograms[[1]], mergedColors[net$blockGenes[[1]]], "Module colors",
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05)
+dev.off()
+moduleLabels = net$colors
+moduleColors = labels2colors(net$colors)
+MEs = net$MEs;
+geneTree = net$dendrograms[[1]]
+```
+
+![](3module.pdf)
+
+#### module的可重复性reproducible (or preserved)
+
+上面找出来的module是否真的存在？它是否会随机出现？需要通过模块的preservation分析，证实module的可重复性。
+
+由于做preservation分析需要两个表达矩阵，即训练和测试，这里我随机切分之前的表达矩阵，来对训练数据集做保守性分析，当然最好一开始就做切分，我这里直接再次切分，给大家提供参考。
+
+##### 1. 建立训练集和测试集
+
+```{r}
+
+library(caret)
+inTraining <- createDataPartition(datExpr$Fth1, p = 0.75, list = FALSE)
+train<- datExpr[inTraining,]
+test<-datExpr[-inTraining,]
+setLabels = c("Train", "Test");
+multiExpr = list(Train = list(data = train), Test = list(data = test));
+multiColor = list(Train =moduleColors  );
+
+```
+
+##### 2. preservation分析
+
+nPermutations官网上给了200，此处为节省时间，nPermutations设置为20
+
+```{r}
+
+nSets = 2
+mp = modulePreservation(multiExpr, multiColor,
+                        referenceNetworks = 1,
+                        nPermutations = 20,
+                        randomSeed = 1,
+                        quickCor = 0,
+                        verbose = 3)
+#save(mp,file = "mp.Rda") 这个很费时间，建议保存一下
+```
+
+推荐的阈值：
+
+Z大于10，代表strong preserved，好的module
+
+大于2小于10代表weak preserved
+
+小于2代表not preserved，不好的module
+
+参考文献：
+
+Langfelder P, Luo R, Oldham MC, Horvath S (2011) **Is my network module preserved and reproducible?** PloS Comp Biol. 7(1): e1001057 <http://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1001057>
+
+```{r}
+ref = 1
+test = 2
+statsObs = cbind(mp$quality$observed[[ref]][[test]][, -1], mp$preservation$observed[[ref]][[test]][, -1])
+statsZ = cbind(mp$quality$Z[[ref]][[test]][, -1], mp$preservation$Z[[ref]][[test]][, -1]);
+print(cbind(statsObs[, c("medianRank.pres", "medianRank.qual")],
+             signif(statsZ[, c("Zsummary.pres", "Zsummary.qual")], 2)) )
+```
+
+其中grey和gold的Z低于2，去掉这两个module
+
+```{r}
+modColors = rownames(mp$preservation$observed[[ref]][[test]])
+moduleSizes = mp$preservation$Z[[ref]][[test]][, 1]
+plotMods = !(modColors %in% c("grey", "gold"))
+```
+
+##### preservation的可视化
+
+```{r}
+# Text labels for points
+text = modColors[plotMods];
+# Auxiliary convenience variable
+plotData = cbind(mp$preservation$observed[[ref]][[test]][, 2], mp$preservation$Z[[ref]][[test]][, 2])
+# Main titles for the plot
+mains = c("Preservation Median rank", "Preservation Zsummary");
+
+sizeGrWindow(10, 5);
+#pdf("4preservation.pdf",width = 20, height = 10)
+par(mfrow = c(1,2))
+par(mar = c(4.5,4.5,2.5,1))
+for (p in 1:2){
+  min = min(plotData[, p], na.rm = TRUE);
+  max = max(plotData[, p], na.rm = TRUE);
+  # Adjust ploting ranges appropriately
+  if (p==2){
+    if (min > -max/10) min = -max/10
+    ylim = c(min - 0.1 * (max-min), max + 0.1 * (max-min))
+  } else
+    ylim = c(min - 0.1 * (max-min), max + 0.1 * (max-min))
+  plot(moduleSizes[plotMods], plotData[plotMods, p], col = 1, bg = modColors[plotMods], pch = 21,
+       main = mains[p],
+       cex = 2.4,
+       ylab = mains[p], xlab = "Module size", log = "x",
+       ylim = ylim,
+       xlim = c(10, 2000), cex.lab = 1.2, cex.axis = 1.2, cex.main =1.4)
+  labelPoints(moduleSizes[plotMods], plotData[plotMods, p], text, cex = 1, offs = 0.08);
+  # For Zsummary, add threshold lines
+  if (p==2){
+    abline(h=0)
+    abline(h=2, col = "blue", lty = 2)
+    abline(h=10, col = "darkgreen", lty = 2)
+  }
+}
+#dev.off()
+```
+
+![](4preservation.pdf)
+
+#### 把gene module输出到文件
+
+输出每个module内的基因，用于后续分析作图，随便你DIY
+
+```{r}
+color<-unique(moduleColors)
+for (i  in 1:length(color)) {
+  y=t(assign(paste(color[i],"expr",sep = "."),datExpr[moduleColors==color[i]]))
+  write.csv(y,paste(color[i],"csv",sep = "."),quote = F)
+}
+```
+
+
+### gene module的深入分析
+
+#### 表型与模块的相关性
+
+通过计算表型与module的相关性，找出相关性高的gene module，推测可能是因为它们造成了表型差异。
+
+```{r}
+samples=read.csv('Sam_info.txt',sep = '\t',row.names = 1)
+
+moduleLabelsAutomatic = net$colors
+moduleColorsAutomatic = labels2colors(moduleLabelsAutomatic)
+moduleColorsWW = moduleColorsAutomatic
+MEs0 = moduleEigengenes(datExpr, moduleColorsWW)$eigengenes
+MEsWW = orderMEs(MEs0)
+modTraitCor = cor(MEsWW, samples, use = "p")
+colnames(MEsWW)
+modlues=MEsWW
+
+modTraitP = corPvalueStudent(modTraitCor, nSamples)
+textMatrix = paste(signif(modTraitCor, 2), "\n(", signif(modTraitP, 1), ")", sep = "")
+dim(textMatrix) = dim(modTraitCor)
+```
+
+```{r}
+pdf("5Module-trait.pdf",width = 6, height = 6)
+labeledHeatmap(Matrix = modTraitCor, xLabels = colnames(samples), yLabels = names(MEsWW), cex.lab = 0.5,  yColorWidth=0.01, 
+               xColorWidth = 0.03,
+               ySymbols = colnames(modlues), colorLabels = FALSE, colors = blueWhiteRed(50), 
+               textMatrix = textMatrix, setStdMargins = FALSE, cex.text = 0.5, zlim = c(-1,1)
+               , main = paste("Module-trait relationships"))
+dev.off()
+```
+
+![](5Module-trait.pdf)
+
+此处brown的gene module与NOD_notx和NOD_KLA的相关性高，推测brown module里的基因可能对NOD组的贡献较大。
+
+#### gene module内基因表达谱的拟合
+
+例子二paper里的数据是时间序列，作者提取表达量最高的30个基因，取平均值（averaged gene expression of top 30）绘制表达谱曲线。
+
+此处取brown的前30个基因，每种细胞取1个样本，假装是5个时间点：
+
+```{r,warning=FALSE}
+df30<-read.csv("midnightblue.csv",row.names = 1)[1:30,]
+#每种细胞取1个样本，假装是5个时间点
+df30time<-df30[,c(1,5,9,13,17)]
+head(df30time)
+
+#算30个基因的平均值，取log2
+dfave<-data.frame(log2(colMeans(df30time)))
+dfave$t<-1:5
+colnames(dfave)<-c("avelog2","time")
+head(dfave)
+```
+
+默认用loess模型拟合，你还可以添加method参数，使用其他方法拟合，例如：method = "lm", 或 "glm", "gam", "loess", "rlm"
+
+```{r, warning=FALSE, message=FALSE,fig.width = 6, fig.height = 3}
+library(ggplot2)
+ggplot(dfave,aes(x = time,y = avelog2)) +
+  geom_smooth(color="black") + #拟合曲线的颜色
+  labs(x = "Days after injury", y = "Expression Level", title = "") + 
+  theme_bw() + #去除背景色
+  theme(panel.grid =element_blank()) + #去除网格线
+  theme(panel.border = element_blank()) + #去除外层边框
+  theme(axis.line = element_line(colour = "grey")) + #坐标轴画成灰色
+  theme(axis.ticks = element_blank()) + #取掉坐标轴上的刻度线
+  geom_hline(yintercept = dfave$avelog2[1],linetype="dashed") #在第一个时间点处画虚线
+```
+
+```{r}
+sessionInfo()
+```
